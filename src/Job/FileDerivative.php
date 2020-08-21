@@ -28,6 +28,7 @@ class FileDerivative extends AbstractJob
         $config = $services->get('Config');
         $logger = $services->get('Omeka\Logger');
         $api = $services->get('Omeka\ApiManager');
+        $downloader = $services->get('Omeka\File\Downloader');
         $tempFileFactory = $services->get('Omeka\File\TempFileFactory');
         // The api cannot update value "has_thumbnails", so use entity manager.
         $entityManager = $services->get('Omeka\EntityManager');
@@ -97,7 +98,7 @@ DQL;
 
         // TODO Manage creation of thumbnails for media without original (youtube…).
         // Check only media with an original file.
-        $criteria->andWhere($expr->eq('hasOriginal', 1));
+//        $criteria->andWhere($expr->eq('hasOriginal', 1));
 
         $criteria->orderBy(['id' => 'ASC']);
 
@@ -138,6 +139,9 @@ DQL;
 
             /** @var \Omeka\Entity\Media $media */
             foreach ($medias as $key => $media) {
+
+                $deleteTempFile = false;
+
                 if ($this->shouldStop()) {
                     $logger->warn(new Message(
                         'The job "Derivative Images" was stopped: %1$d/%2$d resources processed.', // @translate
@@ -146,24 +150,70 @@ DQL;
                     break 2;
                 }
 
-                // Thumbnails are created only if the original file exists.
-                $filename = $media->getFilename();
-                $sourcePath = $basePath . '/original/' . $filename;
+                switch( $media->getRenderer() ) {
+                    case 'file':
+                        // Thumbnails are created only if the original file exists.
+                        $filename = $media->getFilename();
+                        $sourcePath = $basePath . '/original/' . $filename;
 
-                if (!file_exists($sourcePath)) {
-                    $logger->warn(new Message(
-                        'Media #%d (%d/%d): the original file "%s" does not exist.', // @translate
-                        $media->getId(), $offset + $key + 1, $totalToProcess, $filename
-                    ));
-                    continue;
-                }
+                        if (!file_exists($sourcePath)) {
+                            $logger->warn(new Message(
+                                'Media #%d (%d/%d): the original file "%s" does not exist.', // @translate
+                                $media->getId(), $offset + $key + 1, $totalToProcess, $filename
+                            ));
+                            continue 2;
+                        }
 
-                if (!is_readable($sourcePath)) {
-                    $logger->warn(new Message(
-                        'Media #%d (%d/%d): the original file "%s" is not readable.', // @translate
-                        $media->getId(), $offset + $key + 1, $totalToProcess, $filename
-                    ));
-                    continue;
+                        if (!is_readable($sourcePath)) {
+                            $logger->warn(new Message(
+                                'Media #%d (%d/%d): the original file "%s" is not readable.', // @translate
+                                $media->getId(), $offset + $key + 1, $totalToProcess, $filename
+                            ));
+                            continue 2;
+                        }
+
+                        $tempFile = $tempFileFactory->build();
+                        $tempFile->setTempPath($sourcePath);
+                        $tempFile->setStorageId($media->getStorageId());
+
+                        break;
+
+                    case 'iiif':
+
+                        $IIIFData = $media->getData();
+
+                        // Check API version and generate a thumbnail
+                        if (isset($IIIFData['@context']) && $IIIFData['@context'] == 'http://iiif.io/api/image/2/context.json') {
+                            //Version 2.0
+                            $URLString = '/full/full/0/default.jpg';
+                        } else {
+                            // Earlier versions
+                            $URLString = '/full/full/0/native.jpg';
+                        }
+
+                        if (isset($IIIFData['@id'])) {
+                            $tempFile = $downloader->download($IIIFData['@id'] . $URLString);
+                            if (!$tempFile) {
+                                $logger->warn(new Message(
+                                    'Media #%d (%d/%d): error downloading iiif image.', // @translate
+                                    $media->getId(), $offset + $key + 1, $totalToProcess, $filename
+                                ));
+                            }
+                            $tempFile->setStorageId($media->getStorageId());
+                        }
+
+                        $deleteTempFile = true;
+
+                        break;
+
+                    default:
+                        $logger->warn(new Message(
+                            'Media #%d (%d/%d): not supported.', // @translate
+                            $media->getId(), $offset + $key + 1, $totalToProcess, $filename
+                        ));
+
+                        continue 2;
+                        break;
                 }
 
                 // Check the current files.
@@ -184,9 +234,7 @@ DQL;
                     $media->getId(), $offset + $key + 1, $totalToProcess
                 ));
 
-                $tempFile = $tempFileFactory->build();
-                $tempFile->setTempPath($sourcePath);
-                $tempFile->setStorageId($media->getStorageId());
+
 
                 $hasThumbnails = $media->hasThumbnails();
                 $result = $tempFile->storeThumbnails();
@@ -197,6 +245,10 @@ DQL;
                 }
 
                 ++$totalProcessed;
+
+                if ( $deleteTempFile ) {
+                    $tempFile->delete();
+                }
 
                 if ($result) {
                     ++$totalSucceed;
